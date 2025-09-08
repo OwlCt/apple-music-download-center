@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"main/utils/ampapi"
@@ -29,9 +30,10 @@ import (
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/fatih/color"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/grafov/m3u8"
 	"github.com/olekukonko/tablewriter"
-	"github.com/spf13/pflag"
 	"github.com/zhaarey/go-mp4tag"
 	"gopkg.in/yaml.v2"
 )
@@ -325,15 +327,11 @@ func checkArtist(artistUrl string, token string, relationship string) ([]string,
 }
 
 func writeCover(sanAlbumFolder, name string, url string) (string, error) {
-	originalUrl := url
-	var ext string
-	var covPath string
+	covPath := filepath.Join(sanAlbumFolder, name+"."+Config.CoverFormat)
 	if Config.CoverFormat == "original" {
-		ext = strings.Split(url, "/")[len(strings.Split(url, "/"))-2]
+		ext := strings.Split(url, "/")[len(strings.Split(url, "/"))-2]
 		ext = ext[strings.LastIndex(ext, ".")+1:]
 		covPath = filepath.Join(sanAlbumFolder, name+"."+ext)
-	} else {
-		covPath = filepath.Join(sanAlbumFolder, name+"."+Config.CoverFormat)
 	}
 	exists, err := fileExists(covPath)
 	if err != nil {
@@ -364,32 +362,7 @@ func writeCover(sanAlbumFolder, name string, url string) (string, error) {
 	}
 	defer do.Body.Close()
 	if do.StatusCode != http.StatusOK {
-		if Config.CoverFormat == "original" {
-			fmt.Println("Failed to get cover, falling back to " + ext + " url.")
-			splitByDot := strings.Split(originalUrl, ".")
-			last := splitByDot[len(splitByDot)-1]
-			fallback := originalUrl[:len(originalUrl)-len(last)] + ext
-			fallback = strings.Replace(fallback, "{w}x{h}", Config.CoverSize, 1)
-			fmt.Println("Fallback URL:", fallback)
-			req, err = http.NewRequest("GET", fallback, nil)
-			if err != nil {
-				fmt.Println("Failed to create request for fallback url.")
-				return "", err
-			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-			do, err = http.DefaultClient.Do(req)
-			if err != nil {
-				fmt.Println("Failed to get cover from fallback url.")
-				return "", err
-			}
-			defer do.Body.Close()
-			if do.StatusCode != http.StatusOK {
-				fmt.Println(fallback)
-				return "", errors.New(do.Status)
-			}
-		} else {
-			return "", errors.New(do.Status)
-		}
+		return "", errors.New(do.Status)
 	}
 	f, err := os.Create(covPath)
 	if err != nil {
@@ -635,14 +608,16 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 
 // END: New functions for search functionality
 
-func ripTrack(track *task.Track, token string, mediaUserToken string) {
+func ripTrack(track *task.Track, token string, mediaUserToken string, onSub func(int, string)) {
 	var err error
 	counter.Total++
 	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
 	//提前获取到的播放列表下track所在的专辑信息
-	if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
-		track.GetAlbumData(token)
-	}
+        if onSub != nil { onSub(0, track.Resp.Attributes.Name) }
+        if onSub != nil { onSub(5, "") }
+    if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
+        track.GetAlbumData(token)
+    }
 	//mv dl dev
 	if track.Type == "music-videos" {
 		if len(mediaUserToken) <= 50 {
@@ -778,31 +753,35 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			counter.Error++
 			return
 		}
-		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false)
-		if err != nil {
-			fmt.Println("Failed to dl aac-lc:", err)
-			if err.Error() == "Unavailable" {
-				counter.Unavailable++
-				return
-			}
-			counter.Error++
-			return
-		}
-	} else {
-		trackM3u8Url, _, err := extractMedia(track.M3u8, false)
-		if err != nil {
-			fmt.Println("\u26A0 Failed to extract info from manifest:", err)
-			counter.Unavailable++
-			return
-		}
-		//边下载边解密
-		err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config)
-		if err != nil {
-			fmt.Println("Failed to run v2:", err)
-			counter.Error++
-			return
-		}
-	}
+        if onSub != nil { onSub(10, "") }
+        _, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false)
+        if err != nil {
+            fmt.Println("Failed to dl aac-lc:", err)
+            if err.Error() == "Unavailable" {
+                counter.Unavailable++
+                return
+            }
+            counter.Error++
+            return
+        }
+        if onSub != nil { onSub(90, "") }
+    } else {
+        trackM3u8Url, _, err := extractMedia(track.M3u8, false)
+        if err != nil {
+            fmt.Println("\u26A0 Failed to extract info from manifest:", err)
+            counter.Unavailable++
+            return
+        }
+        if onSub != nil { onSub(10, "") }
+        // 边下载边解密（无法精确进度，这里设置阶段性提示）
+        err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config)
+        if err != nil {
+            fmt.Println("Failed to run v2:", err)
+            counter.Error++
+            return
+        }
+        if onSub != nil { onSub(90, "") }
+    }
 	tags := []string{
 		"tool=",
 		fmt.Sprintf("artist=%s", track.Resp.Attributes.ArtistName),
@@ -818,11 +797,12 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	}
 	tagsString := strings.Join(tags, ":")
 	cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("Embed failed: %v\n", err)
-		counter.Error++
-		return
-	}
+    if err := cmd.Run(); err != nil {
+        fmt.Printf("Embed failed: %v\n", err)
+        counter.Error++
+        return
+    }
+    if onSub != nil { onSub(100, "") }
 	if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 		if err := os.Remove(track.CoverPath); err != nil {
 			fmt.Printf("Error deleting file: %s\n", track.CoverPath)
@@ -841,7 +821,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 }
 
-func ripStation(albumId string, token string, storefront string, mediaUserToken string) error {
+func ripStation(albumId string, token string, storefront string, mediaUserToken string, onSub func(int, string)) error {
 	station := task.NewStation(storefront, albumId)
 	err := station.GetResp(mediaUserToken, token, Config.Language)
 	if err != nil {
@@ -1000,7 +980,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 		return nil
 	}
 
-	for i := range station.Tracks {
+    for i := range station.Tracks {
 		station.Tracks[i].CoverPath = covPath
 		station.Tracks[i].SaveDir = playlistFolderPath
 		station.Tracks[i].Codec = Codec
@@ -1019,20 +999,32 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	for i := range station.Tracks {
 		i++
 		if isInArray(selected, i) {
-			ripTrack(&station.Tracks[i-1], token, mediaUserToken)
+            if onSub != nil { onSub(0, "") }
+            ripTrack(&station.Tracks[i-1], token, mediaUserToken, onSub)
+            if onSub != nil { onSub(100, "") }
 		}
 	}
 	return nil
 }
 
-func ripAlbum(albumId string, token string, storefront string, mediaUserToken string, urlArg_i string) error {
+func ripAlbum(
+	albumId string,
+	token string,
+	storefront string,
+	mediaUserToken string,
+	urlArg_i string,
+	selectedFromAPI []int,
+	onProgress func(done, total int, msg string),
+	onSub func(percent int, msg string),
+) error {
 	album := task.NewAlbum(storefront, albumId)
-	err := album.GetResp(token, Config.Language)
-	if err != nil {
+	if err := album.GetResp(token, Config.Language); err != nil {
 		fmt.Println("Failed to get album response.")
 		return err
 	}
 	meta := album.Resp
+
+	// debug 模式下仅探测音质信息
 	if debug_mode {
 		fmt.Println(meta.Data[0].Attributes.ArtistName)
 		fmt.Println(meta.Data[0].Attributes.Name)
@@ -1053,37 +1045,39 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 				m3u8Url = manifest.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls
 			}
 			needCheck := false
-			if Config.GetM3u8Mode == "all" {
-				needCheck = true
-			} else if Config.GetM3u8Mode == "hires" && contains(track.Attributes.AudioTraits, "hi-res-lossless") {
+			if Config.GetM3u8Mode == "all" ||
+				(Config.GetM3u8Mode == "hires" && contains(track.Attributes.AudioTraits, "hi-res-lossless")) {
 				needCheck = true
 			}
 			if needCheck {
-				fullM3u8Url, err := checkM3u8(track.ID, "song")
-				if err == nil && strings.HasSuffix(fullM3u8Url, ".m3u8") {
-					m3u8Url = fullM3u8Url
+				if full, err := checkM3u8(track.ID, "song"); err == nil && strings.HasSuffix(full, ".m3u8") {
+					m3u8Url = full
 				} else {
 					fmt.Println("Failed to get best quality m3u8 from device m3u8 port, will use m3u8 from Web API")
 				}
 			}
 
-			_, _, err = extractMedia(m3u8Url, true)
-			if err != nil {
+			if _, _, err := extractMedia(m3u8Url, true); err != nil {
 				fmt.Printf("Failed to extract quality info for track %d: %v\n", trackNum, err)
 				continue
 			}
 		}
 		return nil
 	}
+
+	// 选择最终编码标签
 	var Codec string
-	if dl_atmos {
+	switch {
+	case dl_atmos:
 		Codec = "ATMOS"
-	} else if dl_aac {
+	case dl_aac:
 		Codec = "AAC"
-	} else {
+	default:
 		Codec = "ALAC"
 	}
 	album.Codec = Codec
+
+	// 生成歌手文件夹
 	var singerFoldername string
 	if Config.ArtistFolderFormat != "" {
 		if len(meta.Data[0].Relationships.Artists.Data) > 0 {
@@ -1105,6 +1099,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		singerFoldername = strings.TrimSpace(singerFoldername)
 		fmt.Println(singerFoldername)
 	}
+
 	singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	if dl_atmos {
 		singerFolder = filepath.Join(Config.AtmosSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
@@ -1112,8 +1107,10 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	if dl_aac {
 		singerFolder = filepath.Join(Config.AacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	}
-	os.MkdirAll(singerFolder, os.ModePerm)
+	_ = os.MkdirAll(singerFolder, os.ModePerm)
 	album.SaveDir = singerFolder
+
+	// 质量字符串（用于命名）
 	var Quality string
 	if strings.Contains(Config.AlbumFolderFormat, "Quality") {
 		if dl_atmos {
@@ -1122,54 +1119,52 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 			Quality = "256Kbps"
 		} else {
 			manifest1, err := ampapi.GetSongResp(storefront, meta.Data[0].Relationships.Tracks.Data[0].ID, album.Language, token)
-			if err != nil {
-				fmt.Println("Failed to get manifest.\n", err)
-			} else {
+			if err == nil {
 				if manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls == "" {
 					Codec = "AAC"
 					Quality = "256Kbps"
 				} else {
 					needCheck := false
-
-					if Config.GetM3u8Mode == "all" {
-						needCheck = true
-					} else if Config.GetM3u8Mode == "hires" && contains(meta.Data[0].Relationships.Tracks.Data[0].Attributes.AudioTraits, "hi-res-lossless") {
+					if Config.GetM3u8Mode == "all" ||
+						(Config.GetM3u8Mode == "hires" && contains(meta.Data[0].Relationships.Tracks.Data[0].Attributes.AudioTraits, "hi-res-lossless")) {
 						needCheck = true
 					}
-					var EnhancedHls_m3u8 string
 					if needCheck {
-						EnhancedHls_m3u8, _ = checkM3u8(meta.Data[0].Relationships.Tracks.Data[0].ID, "album")
-						if strings.HasSuffix(EnhancedHls_m3u8, ".m3u8") {
-							manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls = EnhancedHls_m3u8
+						if full, _ := checkM3u8(meta.Data[0].Relationships.Tracks.Data[0].ID, "album"); strings.HasSuffix(full, ".m3u8") {
+							manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls = full
 						}
 					}
-					_, Quality, err = extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
-					if err != nil {
-						fmt.Println("Failed to extract quality from manifest.\n", err)
+					if _, q, err := extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true); err == nil {
+						Quality = q
 					}
 				}
+			} else {
+				fmt.Println("Failed to get manifest.\n", err)
 			}
 		}
 	}
-	stringsToJoin := []string{}
+
+	// 标签
+	var parts []string
 	if meta.Data[0].Attributes.IsAppleDigitalMaster || meta.Data[0].Attributes.IsMasteredForItunes {
 		if Config.AppleMasterChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.AppleMasterChoice)
+			parts = append(parts, Config.AppleMasterChoice)
 		}
 	}
-	if meta.Data[0].Attributes.ContentRating == "explicit" {
+	switch meta.Data[0].Attributes.ContentRating {
+	case "explicit":
 		if Config.ExplicitChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.ExplicitChoice)
+			parts = append(parts, Config.ExplicitChoice)
 		}
-	}
-	if meta.Data[0].Attributes.ContentRating == "clean" {
+	case "clean":
 		if Config.CleanChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.CleanChoice)
+			parts = append(parts, Config.CleanChoice)
 		}
 	}
-	Tag_string := strings.Join(stringsToJoin, " ")
-	var albumFolderName string
-	albumFolderName = strings.NewReplacer(
+	Tag_string := strings.Join(parts, " ")
+
+	// 专辑目录
+	albumFolderName := strings.NewReplacer(
 		"{ReleaseDate}", meta.Data[0].Attributes.ReleaseDate,
 		"{ReleaseYear}", meta.Data[0].Attributes.ReleaseDate[:4],
 		"{ArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
@@ -1182,43 +1177,30 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		"{Codec}", Codec,
 		"{Tag}", Tag_string,
 	).Replace(Config.AlbumFolderFormat)
-
 	if strings.HasSuffix(albumFolderName, ".") {
 		albumFolderName = strings.ReplaceAll(albumFolderName, ".", "")
 	}
 	albumFolderName = strings.TrimSpace(albumFolderName)
+
 	albumFolderPath := filepath.Join(singerFolder, forbiddenNames.ReplaceAllString(albumFolderName, "_"))
-	os.MkdirAll(albumFolderPath, os.ModePerm)
+	_ = os.MkdirAll(albumFolderPath, os.ModePerm)
 	album.SaveName = albumFolderName
 	fmt.Println(albumFolderName)
-	if Config.SaveArtistCover {
-		if len(meta.Data[0].Relationships.Artists.Data) > 0 {
-			_, err = writeCover(singerFolder, "folder", meta.Data[0].Relationships.Artists.Data[0].Attributes.Artwork.Url)
-			if err != nil {
-				fmt.Println("Failed to write artist cover.")
-			}
+
+	// 封面与动画封面
+	if Config.SaveArtistCover && len(meta.Data[0].Relationships.Artists.Data) > 0 {
+		if _, err := writeCover(singerFolder, "folder", meta.Data[0].Relationships.Artists.Data[0].Attributes.Artwork.Url); err != nil {
+			fmt.Println("Failed to write artist cover.")
 		}
 	}
-	covPath, err := writeCover(albumFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
-	if err != nil {
-		fmt.Println("Failed to write cover.")
-	}
+	covPath, _ := writeCover(albumFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
+
 	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
 		fmt.Println("Found Animation Artwork.")
-
-		motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video)
-		if err != nil {
-			fmt.Println("no motion video square.\n", err)
-		} else {
-			exists, err := fileExists(filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
-			if err != nil {
-				fmt.Println("Failed to check if animated artwork square exists.")
-			}
-			if exists {
-				fmt.Println("Animated artwork square already exists locally.")
-			} else {
+		if url, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video); err == nil {
+			if ok, _ := fileExists(filepath.Join(albumFolderPath, "square_animated_artwork.mp4")); !ok {
 				fmt.Println("Animation Artwork Square Downloading...")
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
+				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", url, "-c", "copy", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork square dl err: %v\n", err)
 				} else {
@@ -1226,27 +1208,14 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 				}
 			}
 		}
-
 		if Config.EmbyAnimatedArtwork {
 			cmd3 := exec.Command("ffmpeg", "-i", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(albumFolderPath, "folder.jpg"))
-			if err := cmd3.Run(); err != nil {
-				fmt.Printf("animated artwork square to gif err: %v\n", err)
-			}
+			_ = cmd3.Run()
 		}
-
-		motionvideoUrlTall, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
-		if err != nil {
-			fmt.Println("no motion video tall.\n", err)
-		} else {
-			exists, err := fileExists(filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
-			if err != nil {
-				fmt.Println("Failed to check if animated artwork tall exists.")
-			}
-			if exists {
-				fmt.Println("Animated artwork tall already exists locally.")
-			} else {
+		if url, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video); err == nil {
+			if ok, _ := fileExists(filepath.Join(albumFolderPath, "tall_animated_artwork.mp4")); !ok {
 				fmt.Println("Animation Artwork Tall Downloading...")
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
+				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", url, "-c", "copy", filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork tall dl err: %v\n", err)
 				} else {
@@ -1255,50 +1224,76 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 			}
 		}
 	}
+
+	// 初始化每首曲目的保存参数
 	for i := range album.Tracks {
 		album.Tracks[i].CoverPath = covPath
 		album.Tracks[i].SaveDir = albumFolderPath
 		album.Tracks[i].Codec = Codec
 	}
-	trackTotal := len(meta.Data[0].Relationships.Tracks.Data)
-	arr := make([]int, trackTotal)
-	for i := 0; i < trackTotal; i++ {
-		arr[i] = i + 1
-	}
 
-	if dl_song {
-		if urlArg_i == "" {
-		} else {
-			for i := range album.Tracks {
-				if urlArg_i == album.Tracks[i].ID {
-					ripTrack(&album.Tracks[i], token, mediaUserToken)
-					return nil
-				}
-			}
+	// === 从这里开始：进度与选择 ===
+	totalAll := len(meta.Data[0].Relationships.Tracks.Data)
+	if totalAll <= 0 {
+		if onProgress != nil {
+			onProgress(0, 1, "no tracks")
 		}
 		return nil
 	}
-	var selected []int
-	if !dl_select {
-		selected = arr
-	} else {
-		selected = album.ShowSelect()
-	}
-	for i := range album.Tracks {
-		i++
-		if isInArray(okDict[albumId], i) {
-			counter.Total++
-			counter.Success++
-			continue
-		}
-		if isInArray(selected, i) {
-			ripTrack(&album.Tracks[i-1], token, mediaUserToken)
-		}
-	}
-	return nil
 
+	// 单曲模式：仅下载 ?i= 指定的曲目（带进度）
+	if dl_song && urlArg_i != "" {
+		if onProgress != nil {
+			onProgress(0, 1, "start single track")
+		}
+        for i := range album.Tracks {
+            if urlArg_i == album.Tracks[i].ID {
+                if onSub != nil { onSub(0, album.Tracks[i].Resp.Attributes.Name) }
+                ripTrack(&album.Tracks[i], token, mediaUserToken, onSub)
+                if onProgress != nil {
+                    onProgress(1, 1, fmt.Sprintf("done: %s", album.Tracks[i].Resp.Attributes.Name))
+                }
+                if onSub != nil { onSub(100, "") }
+                return nil
+            }
+        }
+		// 没找到也结束
+		if onProgress != nil {
+			onProgress(1, 1, "single track not found")
+		}
+		return nil
+	}
+
+	// 选曲：如果未指定，则默认全选
+	selected := selectedFromAPI
+	if len(selected) == 0 {
+		selected = make([]int, totalAll)
+		for i := range selected {
+			selected[i] = i + 1
+		}
+	}
+
+	done := 0
+	total := len(selected)
+	if onProgress != nil {
+		onProgress(0, total, "start album")
+	}
+    for i := range album.Tracks {
+        idx := i + 1
+        if isInArray(selected, idx) {
+            if onSub != nil { onSub(0, "") }
+            ripTrack(&album.Tracks[i], token, mediaUserToken, onSub)
+            done++
+            if onProgress != nil {
+                onProgress(done, total, fmt.Sprintf("done track %d/%d", done, total))
+            }
+            if onSub != nil { onSub(100, "") }
+        }
+    }
+	return nil
 }
-func ripPlaylist(playlistId string, token string, storefront string, mediaUserToken string) error {
+
+func ripPlaylist(playlistId string, token string, storefront string, mediaUserToken string, selectedFromAPI []int, onProgress func(done, total int, msg string), onSub func(percent int, msg string)) error {
 	playlist := task.NewPlaylist(storefront, playlistId)
 	err := playlist.GetResp(token, Config.Language)
 	if err != nil {
@@ -1306,6 +1301,8 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		return err
 	}
 	meta := playlist.Resp
+
+	// 调试模式：只展示可用音频/码率信息后返回
 	if debug_mode {
 		fmt.Println(meta.Data[0].Attributes.ArtistName)
 		fmt.Println(meta.Data[0].Attributes.Name)
@@ -1348,6 +1345,8 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		}
 		return nil
 	}
+
+	// 编码类型
 	var Codec string
 	if dl_atmos {
 		Codec = "ATMOS"
@@ -1357,6 +1356,8 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		Codec = "ALAC"
 	}
 	playlist.Codec = Codec
+
+	// “Apple Music” 目录
 	var singerFoldername string
 	if Config.ArtistFolderFormat != "" {
 		singerFoldername = strings.NewReplacer(
@@ -1377,9 +1378,10 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	if dl_aac {
 		singerFolder = filepath.Join(Config.AacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	}
-	os.MkdirAll(singerFolder, os.ModePerm)
+	_ = os.MkdirAll(singerFolder, os.ModePerm)
 	playlist.SaveDir = singerFolder
 
+	// 质量标签（仅用于命名）
 	var Quality string
 	if strings.Contains(Config.AlbumFolderFormat, "Quality") {
 		if dl_atmos {
@@ -1396,44 +1398,40 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 					Quality = "256Kbps"
 				} else {
 					needCheck := false
-
 					if Config.GetM3u8Mode == "all" {
 						needCheck = true
 					} else if Config.GetM3u8Mode == "hires" && contains(meta.Data[0].Relationships.Tracks.Data[0].Attributes.AudioTraits, "hi-res-lossless") {
 						needCheck = true
 					}
-					var EnhancedHls_m3u8 string
 					if needCheck {
-						EnhancedHls_m3u8, _ = checkM3u8(meta.Data[0].Relationships.Tracks.Data[0].ID, "album")
-						if strings.HasSuffix(EnhancedHls_m3u8, ".m3u8") {
-							manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls = EnhancedHls_m3u8
+						if enhanced, _ := checkM3u8(meta.Data[0].Relationships.Tracks.Data[0].ID, "album"); strings.HasSuffix(enhanced, ".m3u8") {
+							manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls = enhanced
 						}
 					}
-					_, Quality, err = extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
-					if err != nil {
-						fmt.Println("Failed to extract quality from manifest.\n", err)
+					if _, q, err := extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true); err == nil {
+						Quality = q
 					}
 				}
 			}
 		}
 	}
-	stringsToJoin := []string{}
+
+	// 标记/命名
+	var tagsForName []string
 	if meta.Data[0].Attributes.IsAppleDigitalMaster || meta.Data[0].Attributes.IsMasteredForItunes {
 		if Config.AppleMasterChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.AppleMasterChoice)
+			tagsForName = append(tagsForName, Config.AppleMasterChoice)
 		}
 	}
-	if meta.Data[0].Attributes.ContentRating == "explicit" {
-		if Config.ExplicitChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.ExplicitChoice)
-		}
+	if meta.Data[0].Attributes.ContentRating == "explicit" && Config.ExplicitChoice != "" {
+		tagsForName = append(tagsForName, Config.ExplicitChoice)
 	}
-	if meta.Data[0].Attributes.ContentRating == "clean" {
-		if Config.CleanChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.CleanChoice)
-		}
+	if meta.Data[0].Attributes.ContentRating == "clean" && Config.CleanChoice != "" {
+		tagsForName = append(tagsForName, Config.CleanChoice)
 	}
-	Tag_string := strings.Join(stringsToJoin, " ")
+	Tag_string := strings.Join(tagsForName, " ")
+
+	// 歌单目录
 	playlistFolder := strings.NewReplacer(
 		"{ArtistName}", "Apple Music",
 		"{PlaylistName}", LimitString(meta.Data[0].Attributes.Name),
@@ -1447,34 +1445,30 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	}
 	playlistFolder = strings.TrimSpace(playlistFolder)
 	playlistFolderPath := filepath.Join(singerFolder, forbiddenNames.ReplaceAllString(playlistFolder, "_"))
-	os.MkdirAll(playlistFolderPath, os.ModePerm)
+	_ = os.MkdirAll(playlistFolderPath, os.ModePerm)
 	playlist.SaveName = playlistFolder
 	fmt.Println(playlistFolder)
+
+	// 封面
 	covPath, err := writeCover(playlistFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
 	if err != nil {
 		fmt.Println("Failed to write cover.")
 	}
 
+	// 绑定轨道路径
 	for i := range playlist.Tracks {
 		playlist.Tracks[i].CoverPath = covPath
 		playlist.Tracks[i].SaveDir = playlistFolderPath
 		playlist.Tracks[i].Codec = Codec
 	}
 
+	// 动画封面（与原逻辑一致）
 	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
 		fmt.Println("Found Animation Artwork.")
 
-		motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video)
-		if err != nil {
-			fmt.Println("no motion video square.\n", err)
-		} else {
-			exists, err := fileExists(filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
-			if err != nil {
-				fmt.Println("Failed to check if animated artwork square exists.")
-			}
-			if exists {
-				fmt.Println("Animated artwork square already exists locally.")
-			} else {
+		if motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video); err == nil {
+			exists, _ := fileExists(filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
+			if !exists {
 				fmt.Println("Animation Artwork Square Downloading...")
 				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
@@ -1483,6 +1477,8 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 					fmt.Println("Animation Artwork Square Downloaded")
 				}
 			}
+		} else {
+			fmt.Println("no motion video square.\n", err)
 		}
 
 		if Config.EmbyAnimatedArtwork {
@@ -1492,17 +1488,9 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 			}
 		}
 
-		motionvideoUrlTall, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
-		if err != nil {
-			fmt.Println("no motion video tall.\n", err)
-		} else {
-			exists, err := fileExists(filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
-			if err != nil {
-				fmt.Println("Failed to check if animated artwork tall exists.")
-			}
-			if exists {
-				fmt.Println("Animated artwork tall already exists locally.")
-			} else {
+		if motionvideoUrlTall, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video); err == nil {
+			exists, _ := fileExists(filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
+			if !exists {
 				fmt.Println("Animation Artwork Tall Downloading...")
 				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
@@ -1511,31 +1499,46 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 					fmt.Println("Animation Artwork Tall Downloaded")
 				}
 			}
+		} else {
+			fmt.Println("no motion video tall.\n", err)
 		}
 	}
-	trackTotal := len(meta.Data[0].Relationships.Tracks.Data)
-	arr := make([]int, trackTotal)
-	for i := 0; i < trackTotal; i++ {
-		arr[i] = i + 1
-	}
-	var selected []int
 
-	if !dl_select {
-		selected = arr
+	// ====== 进度 & 选曲 ======
+	trackTotalAll := len(meta.Data[0].Relationships.Tracks.Data)
+
+	// 全量曲目数组（修复 undefined: arr）
+	fullArr := make([]int, trackTotalAll)
+	for i := 0; i < trackTotalAll; i++ {
+		fullArr[i] = i + 1
+	}
+
+	var selected []int
+	if len(selectedFromAPI) > 0 {
+		selected = selectedFromAPI
 	} else {
-		selected = playlist.ShowSelect()
+		selected = fullArr
 	}
-	for i := range playlist.Tracks {
-		i++
-		if isInArray(okDict[playlistId], i) {
-			counter.Total++
-			counter.Success++
-			continue
-		}
-		if isInArray(selected, i) {
-			ripTrack(&playlist.Tracks[i-1], token, mediaUserToken)
-		}
+
+	// 以选择的曲目数作为总进度分母
+	trackTotal := len(selected)
+	if onProgress != nil {
+		onProgress(0, trackTotal, "start playlist")
 	}
+
+    done := 0
+    for i := range playlist.Tracks {
+        idx := i + 1
+        if isInArray(selected, idx) {
+            if onSub != nil { onSub(0, playlist.Tracks[i].Resp.Attributes.Name) }
+            ripTrack(&playlist.Tracks[i], token, mediaUserToken, onSub)
+            done++
+            if onProgress != nil {
+                onProgress(done, trackTotal, fmt.Sprintf("done track %d/%d", done, trackTotal))
+            }
+            if onSub != nil { onSub(100, "") }
+        }
+    }
 	return nil
 }
 
@@ -1631,192 +1634,164 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 func main() {
 	err := loadConfig()
 	if err != nil {
-		fmt.Printf("load Config failed: %v", err)
-		return
+		log.Fatalf("load Config failed: %v", err)
 	}
+
 	token, err := ampapi.GetToken()
 	if err != nil {
 		if Config.AuthorizationToken != "" && Config.AuthorizationToken != "your-authorization-token" {
 			token = strings.Replace(Config.AuthorizationToken, "Bearer ", "", -1)
 		} else {
-			fmt.Println("Failed to get token.")
-			return
+			log.Fatalf("Failed to get token.")
 		}
 	}
-	var search_type string
-	pflag.StringVar(&search_type, "search", "", "Search for 'album', 'song', or 'artist'. Provide query after flags.")
-	pflag.BoolVar(&dl_atmos, "atmos", false, "Enable atmos download mode")
-	pflag.BoolVar(&dl_aac, "aac", false, "Enable adm-aac download mode")
-	pflag.BoolVar(&dl_select, "select", false, "Enable selective download")
-	pflag.BoolVar(&dl_song, "song", false, "Enable single song download mode")
-	pflag.BoolVar(&artist_select, "all-album", false, "Download all artist albums")
-	pflag.BoolVar(&debug_mode, "debug", false, "Enable debug mode to show audio quality information")
-	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
-	atmos_max = pflag.Int("atmos-max", Config.AtmosMax, "Specify the max quality for download atmos")
-	aac_type = pflag.String("aac-type", Config.AacType, "Select AAC type, aac aac-binaural aac-downmix")
-	mv_audio_type = pflag.String("mv-audio-type", Config.MVAudioType, "Select MV audio type, atmos ac3 aac")
-	mv_max = pflag.Int("mv-max", Config.MVMax, "Specify the max quality for download MV")
 
-	pflag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] [url1 url2 ...]\n", "[main | main.exe | go run main.go]")
-		fmt.Fprintf(os.Stderr, "Search Usage: %s --search [album|song|artist] [query]\n", "[main | main.exe | go run main.go]")
-		fmt.Println("\nOptions:")
-		pflag.PrintDefaults()
-	}
+	// 初始化任务管理器与下载执行器
+	mgr := NewTaskManager(2, 128) // 2 个 worker，队列 128
 
-	pflag.Parse()
-	Config.AlacMax = *alac_max
-	Config.AtmosMax = *atmos_max
-	Config.AacType = *aac_type
-	Config.MVAudioType = *mv_audio_type
-	Config.MVMax = *mv_max
+    mgr.BindRunner(func(t *Task) error {
+		dl_atmos, dl_aac, dl_song = false, false, false
+		switch t.Quality {
+		case "atmos":
+			dl_atmos = true
+		case "aac":
+			dl_aac = true
+		}
 
-	args := pflag.Args()
+		if t.SongOnly {
+			dl_song = true
+		}
 
-	if search_type != "" {
-		if len(args) == 0 {
-			fmt.Println("Error: --search flag requires a query.")
-			pflag.Usage()
-			return
-		}
-		selectedUrl, err := handleSearch(search_type, args, token)
-		if err != nil {
-			fmt.Printf("\nSearch process failed: %v\n", err)
-			return
-		}
-		if selectedUrl == "" {
-			fmt.Println("\nExiting.")
-			return
-		}
-		os.Args = []string{selectedUrl}
-	} else {
-		if len(args) == 0 {
-			fmt.Println("No URLs provided. Please provide at least one URL.")
-			pflag.Usage()
-			return
-		}
-		os.Args = args
-	}
+        appendLog := func(msg string) { mgr.AppendLog(t.ID, msg) }
+        setSub := func(p int, msg string) { mgr.SetSubProgress(t.ID, p, msg) }
 
-	if strings.Contains(os.Args[0], "/artist/") {
-		urlArtistName, urlArtistID, err := getUrlArtistName(os.Args[0], token)
-		if err != nil {
-			fmt.Println("Failed to get artistname.")
-			return
-		}
-		Config.ArtistFolderFormat = strings.NewReplacer(
-			"{UrlArtistName}", LimitString(urlArtistName),
-			"{ArtistId}", urlArtistID,
-		).Replace(Config.ArtistFolderFormat)
-		albumArgs, err := checkArtist(os.Args[0], token, "albums")
-		if err != nil {
-			fmt.Println("Failed to get artist albums.")
-			return
-		}
-		mvArgs, err := checkArtist(os.Args[0], token, "music-videos")
-		if err != nil {
-			fmt.Println("Failed to get artist music-videos.")
-		}
-		os.Args = append(albumArgs, mvArgs...)
-	}
-	albumTotal := len(os.Args)
-	for {
-		for albumNum, urlRaw := range os.Args {
-			fmt.Printf("Queue %d of %d: ", albumNum+1, albumTotal)
-			var storefront, albumId string
-
-			if strings.Contains(urlRaw, "/music-video/") {
-				fmt.Println("Music Video")
-				if debug_mode {
-					continue
-				}
-				counter.Total++
-				if len(Config.MediaUserToken) <= 50 {
-					fmt.Println(": meida-user-token is not set, skip MV dl")
-					counter.Success++
-					continue
-				}
-				if _, err := exec.LookPath("mp4decrypt"); err != nil {
-					fmt.Println(": mp4decrypt is not found, skip MV dl")
-					counter.Success++
-					continue
-				}
-				mvSaveDir := strings.NewReplacer(
-					"{ArtistName}", "",
-					"{UrlArtistName}", "",
-					"{ArtistId}", "",
-				).Replace(Config.ArtistFolderFormat)
-				if mvSaveDir != "" {
-					mvSaveDir = filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(mvSaveDir, "_"))
-				} else {
-					mvSaveDir = Config.AlacSaveFolder
-				}
-				storefront, albumId = checkUrlMv(urlRaw)
-				err := mvDownloader(albumId, mvSaveDir, token, storefront, Config.MediaUserToken, nil)
-				if err != nil {
-					fmt.Println("\u26A0 Failed to dl MV:", err)
-					counter.Error++
-					continue
-				}
-				counter.Success++
-				continue
+		// 取消检查辅助
+		canceled := func() bool {
+			if t.Canceled {
+				appendLog("canceled")
+				return true
 			}
-			if strings.Contains(urlRaw, "/song/") {
-				fmt.Printf("Song->")
-				storefront, songId := checkUrlSong(urlRaw)
-				if storefront == "" || songId == "" {
-					fmt.Println("Invalid song URL format.")
-					continue
-				}
-				err := ripSong(songId, token, storefront, Config.MediaUserToken)
-				if err != nil {
-					fmt.Println("Failed to rip song:", err)
-				}
-				continue
+			return false
+		}
+
+		setProgress := func(done, total int, msg string) {
+			mgr.mu.Lock()
+			if total <= 0 {
+				total = 1
 			}
-			parse, err := url.Parse(urlRaw)
+			t.TotalUnits = total
+			t.DoneUnits = done
+			t.Progress = int(float64(done) / float64(total) * 100.0)
+			if t.Progress > 100 {
+				t.Progress = 100
+			}
+			if msg != "" {
+				t.Logs = append(t.Logs, msg)
+				t.Message = msg
+                if len(t.Logs) > 1000 {
+                    t.Logs = t.Logs[len(t.Logs)-1000:]
+                }
+			}
+			mgr.mu.Unlock()
+		}
+
+		urlRaw := t.URL
+		if strings.Contains(urlRaw, "/song/") {
+			u, err := getUrlSong(urlRaw, t.Token)
 			if err != nil {
-				log.Fatalf("Invalid URL: %v", err)
+				appendLog("Failed to get Song info: " + err.Error())
+				return err
 			}
-			var urlArg_i = parse.Query().Get("i")
+			urlRaw = u
+			dl_song = true
+		}
 
-			if strings.Contains(urlRaw, "/album/") {
-				fmt.Println("Album")
-				storefront, albumId = checkUrl(urlRaw)
-				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i)
-				if err != nil {
-					fmt.Println("Failed to rip album:", err)
-				}
-			} else if strings.Contains(urlRaw, "/playlist/") {
-				fmt.Println("Playlist")
-				storefront, albumId = checkUrlPlaylist(urlRaw)
-				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken)
-				if err != nil {
-					fmt.Println("Failed to rip playlist:", err)
-				}
-			} else if strings.Contains(urlRaw, "/station/") {
-				fmt.Printf("Station")
-				storefront, albumId = checkUrlStation(urlRaw)
-				if len(Config.MediaUserToken) <= 50 {
-					fmt.Println(": meida-user-token is not set, skip station dl")
-					continue
-				}
-				err := ripStation(albumId, token, storefront, Config.MediaUserToken)
-				if err != nil {
-					fmt.Println("Failed to rip station:", err)
-				}
-			} else {
-				fmt.Println("Invalid type")
+		var urlArg_i string
+		if p, err := url.Parse(urlRaw); err == nil {
+			urlArg_i = p.Query().Get("i")
+		}
+
+        runOnce := func() error {
+            switch {
+            case strings.Contains(urlRaw, "/music-video/"):
+                appendLog("Type: Music Video")
+                setProgress(0, 4, "prepare mv")
+                setSub(0, "")
+                if len(Config.MediaUserToken) <= 50 {
+                    appendLog("media-user-token not set, skip MV")
+                    setProgress(4, 4, "mv skipped")
+                    setSub(100, "")
+                    return nil
+                }
+                _, mvID := checkUrlMv(urlRaw)
+                saveDir := Config.AlacSaveFolder
+                if err := mvDownloader(mvID, saveDir, t.Token, Config.Storefront, Config.MediaUserToken, nil); err != nil {
+                    return err
+                }
+                setProgress(4, 4, "mv done")
+                setSub(100, "")
+                return nil
+
+            case strings.Contains(urlRaw, "/album/"):
+                appendLog("Type: Album")
+                storefront, albumId := checkUrl(urlRaw)
+                return ripAlbum(albumId, t.Token, storefront, Config.MediaUserToken, urlArg_i, t.Tracks, setProgress, setSub)
+
+            case strings.Contains(urlRaw, "/playlist/"):
+                appendLog("Type: Playlist")
+                storefront, pid := checkUrlPlaylist(urlRaw)
+                return ripPlaylist(pid, t.Token, storefront, Config.MediaUserToken, t.Tracks, setProgress, setSub)
+
+            case strings.Contains(urlRaw, "/station/"):
+                appendLog("Type: Station")
+                storefront, sid := checkUrlStation(urlRaw)
+                if len(Config.MediaUserToken) <= 50 {
+                    appendLog("media-user-token not set, skip station")
+                    return nil
+                }
+                setProgress(0, 3, "prepare station")
+                if err := ripStation(sid, t.Token, storefront, Config.MediaUserToken, setSub); err != nil {
+                    return err
+                }
+                setProgress(3, 3, "station done")
+                setSub(100, "")
+                return nil
+
+			default:
+				return fmt.Errorf("invalid url type")
 			}
 		}
-		fmt.Printf("=======  [\u2714 ] Completed: %d/%d  |  [\u26A0 ] Warnings: %d  |  [\u2716 ] Errors: %d  =======\n", counter.Success, counter.Total, counter.Unavailable+counter.NotSong, counter.Error)
-		if counter.Error == 0 {
-			break
+
+		var err error
+		for attempt := 0; attempt <= t.MaxRetries; attempt++ {
+			if canceled() {
+				return fmt.Errorf("canceled")
+			}
+			if attempt > 0 {
+				appendLog(fmt.Sprintf("retry %d...", attempt))
+				for i := 0; i < 3; i++ { // 可中断等待
+					if canceled() { return fmt.Errorf("canceled") }
+					time.Sleep(time.Second)
+				}
+			}
+			err = runOnce()
+			if err == nil {
+				break
+			}
+			appendLog("error: " + err.Error())
 		}
-		fmt.Println("Error detected, press Enter to try again...")
-		fmt.Scanln()
-		fmt.Println("Start trying again...")
-		counter = structs.Counter{}
+		return err
+	})
+
+	// 启动 HTTP API
+	r := gin.Default()
+	// Web UI 静态资源
+    r.Static("/static", "./web")
+    r.GET("/", func(c *gin.Context) { c.File("web/index.html") })
+	registerRoutes(r, mgr, token)
+	log.Println("HTTP server listening on :8080")
+	if err := r.Run(":8080"); err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -2341,24 +2316,692 @@ func extractVideo(c string) (string, error) {
 	return streamUrl.String(), nil
 }
 
-func ripSong(songId string, token string, storefront string, mediaUserToken string) error {
-	// Get song info to find album ID
-	manifest, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
-	if err != nil {
-		fmt.Println("Failed to get song response.")
-		return err
+// ======== Web API: 轻量任务管理与路由 ========
+
+type TaskStatus string
+
+const (
+	StatusQueued    TaskStatus = "queued"
+	StatusRunning   TaskStatus = "running"
+	StatusSucceeded TaskStatus = "succeeded"
+	StatusFailed    TaskStatus = "failed"
+)
+
+type Task struct {
+	ID         string     `json:"id"`
+	URL        string     `json:"url"`
+	Quality    string     `json:"quality"` // alac/aac/atmos
+	Status     TaskStatus `json:"status"`
+	Progress   int        `json:"progress"`
+	TotalUnits int        `json:"totalUnits"` // 总曲目数/阶段数
+	DoneUnits  int        `json:"doneUnits"`  // 已完成曲目/阶段
+	Message    string     `json:"message"`
+	Logs       []string   `json:"logs"`
+	Token      string     `json:"-"` // 使用到的授权 token（可热更新）
+	// 选项快照（用于 runner）
+	Tracks     []int `json:"-"`
+    SongOnly   bool  `json:"-"`
+    MaxRetries int   `json:"-"`
+    CreatedAt  time.Time `json:"createdAt"`
+    UpdatedAt  time.Time `json:"updatedAt"`
+    Canceled   bool      `json:"canceled"`
+    SubPercent int       `json:"subPercent"`
+    SubMessage string    `json:"subMessage,omitempty"`
+}
+
+type TaskManager struct {
+	mu      sync.RWMutex
+	tasks   map[string]*Task
+	queue   chan string
+	workers int
+	runner  func(*Task) error
+}
+
+func NewTaskManager(workers, queueSize int) *TaskManager {
+	m := &TaskManager{
+		tasks:   make(map[string]*Task),
+		queue:   make(chan string, queueSize),
+		workers: workers,
 	}
-
-	songData := manifest.Data[0]
-	albumId := songData.Relationships.Albums.Data[0].ID
-
-	// Use album approach but only download the specific song
-	dl_song = true
-	err = ripAlbum(albumId, token, storefront, mediaUserToken, songId)
-	if err != nil {
-		fmt.Println("Failed to rip song:", err)
-		return err
+	for i := 0; i < workers; i++ {
+		go m.worker()
 	}
+	return m
+}
 
-	return nil
+func (m *TaskManager) BindRunner(r func(*Task) error) { m.runner = r }
+
+func (m *TaskManager) Create(url, quality, token string) *Task {
+	id := uuid.New().String()
+	t := &Task{
+		ID:       id,
+		URL:      url,
+		Quality:  quality,
+		Status:   StatusQueued,
+		Progress: 0,
+        Logs:     []string{"queued"},
+        Token:    token,
+        CreatedAt: time.Now(),
+        UpdatedAt: time.Now(),
+    }
+	m.mu.Lock()
+	m.tasks[id] = t
+	m.mu.Unlock()
+	m.queue <- id
+	return t
+}
+
+func (m *TaskManager) Get(id string) (*Task, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	t, ok := m.tasks[id]
+	return t, ok
+}
+
+func (m *TaskManager) List() []*Task {
+	mu := &m.mu
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make([]*Task, 0, len(m.tasks))
+	for _, t := range m.tasks {
+		out = append(out, t)
+	}
+    sort.Slice(out, func(i, j int) bool {
+        if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+            return out[i].ID < out[j].ID
+        }
+        return out[i].CreatedAt.Before(out[j].CreatedAt)
+    })
+    return out
+}
+
+func (m *TaskManager) AppendLog(id, msg string) {
+    m.mu.Lock()
+    if t, ok := m.tasks[id]; ok {
+        t.Logs = append(t.Logs, msg)
+        t.Message = msg
+        t.UpdatedAt = time.Now()
+        if len(t.Logs) > 1000 {
+            t.Logs = t.Logs[len(t.Logs)-1000:]
+        }
+    }
+    m.mu.Unlock()
+}
+
+// ClearCompleted 删除状态为 succeeded/failed 的任务，返回删除数量
+func (m *TaskManager) ClearCompleted() int {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    removed := 0
+    for id, t := range m.tasks {
+        if t.Status == StatusSucceeded || t.Status == StatusFailed {
+            delete(m.tasks, id)
+            removed++
+        }
+    }
+    return removed
+}
+
+// SetSubProgress 更新子进度（当前曲目标记），仅用于运行中任务
+func (m *TaskManager) SetSubProgress(id string, percent int, msg string) {
+    if percent < 0 { percent = 0 }
+    if percent > 100 { percent = 100 }
+    m.mu.Lock()
+    if t, ok := m.tasks[id]; ok {
+        t.SubPercent = percent
+        if msg != "" { t.SubMessage = msg }
+        t.UpdatedAt = time.Now()
+    }
+    m.mu.Unlock()
+}
+
+// Cancel 标记任务为取消。对排队任务会直接标记失败；对运行中任务标记为取消中
+func (m *TaskManager) Cancel(id string) bool {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    if t, ok := m.tasks[id]; ok {
+        t.Canceled = true
+        if t.Status == StatusQueued {
+            t.Status = StatusFailed
+            t.Message = "canceled"
+            t.Logs = append(t.Logs, "canceled")
+        } else if t.Status == StatusRunning {
+            t.Message = "canceling"
+            t.Logs = append(t.Logs, "cancel requested")
+        }
+        t.UpdatedAt = time.Now()
+        return true
+    }
+    return false
+}
+
+// Delete 删除一个非运行中的任务（包括排队/已完成/失败）。运行中返回 false
+func (m *TaskManager) Delete(id string) bool {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    if t, ok := m.tasks[id]; ok {
+        if t.Status == StatusRunning {
+            return false
+        }
+        delete(m.tasks, id)
+        return true
+    }
+    return false
+}
+
+func (m *TaskManager) setStatus(t *Task, s TaskStatus, msg string) {
+    m.mu.Lock()
+    t.Status = s
+    t.Message = msg
+    if msg != "" {
+        t.Logs = append(t.Logs, msg)
+    }
+    t.UpdatedAt = time.Now()
+    if len(t.Logs) > 1000 {
+        t.Logs = t.Logs[len(t.Logs)-1000:]
+    }
+    m.mu.Unlock()
+}
+
+func (m *TaskManager) worker() {
+    for id := range m.queue {
+        m.mu.RLock()
+        t := m.tasks[id]
+        m.mu.RUnlock()
+        if t == nil {
+            continue
+        }
+        // 若已被取消，直接标记并跳过
+        if t.Canceled {
+            m.setStatus(t, StatusFailed, "canceled")
+            continue
+        }
+        m.setStatus(t, StatusRunning, "started")
+        if t.Canceled {
+            m.setStatus(t, StatusFailed, "canceled")
+            continue
+        }
+        if m.runner == nil {
+            m.setStatus(t, StatusFailed, "runner not bound")
+            continue
+        }
+        if err := m.runner(t); err != nil {
+            m.setStatus(t, StatusFailed, err.Error())
+        } else {
+            m.setStatus(t, StatusSucceeded, "done")
+        }
+    }
+}
+
+type createTaskReq struct {
+	URLs       []string `json:"urls"`
+	URL        string   `json:"url,omitempty"`
+	Quality    string   `json:"quality" binding:"required,oneof=alac aac atmos"`
+	Tracks     []int    `json:"tracks,omitempty"`     // 选曲，如 [1,3,5]；空=全下
+	SongOnly   bool     `json:"songOnly,omitempty"`   // 单曲模式（等价 CLI 的 --song）
+	MaxRetries int      `json:"maxRetries,omitempty"` // 自动重试次数（可选，默认 1）
+}
+
+func registerRoutes(r *gin.Engine, mgr *TaskManager, token string) {
+    v1 := r.Group("/v1")
+    {
+        // 清空下载目录：删除 Config 中配置的三个保存目录内的所有内容
+        v1.POST("/cleanup-downloads", func(c *gin.Context) {
+            // 若存在运行中的任务，拒绝清理
+            mgr.mu.RLock()
+            running := false
+            for _, t := range mgr.tasks {
+                if t.Status == StatusRunning {
+                    running = true
+                    break
+                }
+            }
+            mgr.mu.RUnlock()
+            if running {
+                c.JSON(http.StatusConflict, gin.H{"error": "有任务仍在运行，无法清空下载目录"})
+                return
+            }
+
+            base, err := os.Getwd()
+            if err != nil {
+                c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                return
+            }
+
+            // 规范化 base，用于子路径校验
+            baseAbs, err := filepath.Abs(base)
+            if err != nil {
+                c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                return
+            }
+            if !strings.HasSuffix(baseAbs, string(os.PathSeparator)) {
+                baseAbs = baseAbs + string(os.PathSeparator)
+            }
+
+            folders := []string{Config.AlacSaveFolder, Config.AacSaveFolder, Config.AtmosSaveFolder}
+            type stat struct{ Files, Dirs int }
+            total := stat{}
+            cleaned := make([]gin.H, 0, len(folders))
+            for _, name := range folders {
+                dir := filepath.Join(baseAbs, name)
+                dirAbs, _ := filepath.Abs(dir)
+                // 子路径安全校验
+                if !strings.HasPrefix(dirAbs+string(os.PathSeparator), baseAbs) && dirAbs != strings.TrimSuffix(baseAbs, string(os.PathSeparator)) {
+                    cleaned = append(cleaned, gin.H{"folder": name, "error": "路径不安全，已跳过"})
+                    continue
+                }
+                info, err := os.Stat(dirAbs)
+                if err != nil {
+                    if os.IsNotExist(err) {
+                        cleaned = append(cleaned, gin.H{"folder": name, "skipped": true, "reason": "不存在"})
+                        continue
+                    }
+                    cleaned = append(cleaned, gin.H{"folder": name, "error": err.Error()})
+                    continue
+                }
+                if !info.IsDir() {
+                    cleaned = append(cleaned, gin.H{"folder": name, "error": "不是目录"})
+                    continue
+                }
+                entries, err := os.ReadDir(dirAbs)
+                if err != nil {
+                    cleaned = append(cleaned, gin.H{"folder": name, "error": err.Error()})
+                    continue
+                }
+                cur := stat{}
+                for _, e := range entries {
+                    p := filepath.Join(dirAbs, e.Name())
+                    if err := os.RemoveAll(p); err != nil {
+                        cleaned = append(cleaned, gin.H{"folder": name, "item": e.Name(), "error": err.Error()})
+                        continue
+                    }
+                    if e.IsDir() {
+                        cur.Dirs++
+                    } else {
+                        cur.Files++
+                    }
+                }
+                total.Files += cur.Files
+                total.Dirs += cur.Dirs
+                cleaned = append(cleaned, gin.H{"folder": name, "deletedFiles": cur.Files, "deletedDirs": cur.Dirs})
+            }
+            c.JSON(http.StatusOK, gin.H{
+                "deletedFiles": total.Files,
+                "deletedDirs":  total.Dirs,
+                "folders":      cleaned,
+            })
+        })
+
+        // 关键词搜索（album|song|artist）
+        v1.GET("/search", func(c *gin.Context) {
+            q := strings.TrimSpace(c.Query("q"))
+            typ := strings.TrimSpace(c.Query("type"))
+            if q == "" || (typ != "album" && typ != "song" && typ != "artist") {
+                c.JSON(http.StatusBadRequest, gin.H{"error": "q and type=album|song|artist required"})
+                return
+            }
+            limitStr := c.DefaultQuery("limit", "20")
+            offsetStr := c.DefaultQuery("offset", "0")
+            limit, _ := strconv.Atoi(limitStr)
+            offset, _ := strconv.Atoi(offsetStr)
+            if limit <= 0 || limit > 50 { limit = 20 }
+            if offset < 0 { offset = 0 }
+
+            apiType := typ + "s"
+            sr, err := ampapi.Search(Config.Storefront, q, apiType, Config.Language, token, limit, offset)
+            if err != nil {
+                c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+                return
+            }
+            out := make([]gin.H, 0, limit)
+            switch typ {
+            case "album":
+                if sr.Results.Albums != nil {
+                    for _, it := range sr.Results.Albums.Data {
+                        year := ""
+                        if len(it.Attributes.ReleaseDate) >= 4 { year = it.Attributes.ReleaseDate[:4] }
+                        out = append(out, gin.H{
+                            "id": it.ID,
+                            "name": it.Attributes.Name,
+                            "artist": it.Attributes.ArtistName,
+                            "year": year,
+                            "tracks": it.Attributes.TrackCount,
+                            "url": it.Attributes.URL,
+                        })
+                    }
+                }
+            case "song":
+                if sr.Results.Songs != nil {
+                    for _, it := range sr.Results.Songs.Data {
+                        out = append(out, gin.H{
+                            "id": it.ID,
+                            "name": it.Attributes.Name,
+                            "artist": it.Attributes.ArtistName,
+                            "album": it.Attributes.AlbumName,
+                            "url": it.Attributes.URL,
+                        })
+                    }
+                }
+            case "artist":
+                if sr.Results.Artists != nil {
+                    for _, it := range sr.Results.Artists.Data {
+                        genres := ""
+                        if len(it.Attributes.GenreNames) > 0 { genres = strings.Join(it.Attributes.GenreNames, ", ") }
+                        out = append(out, gin.H{
+                            "id": it.ID,
+                            "name": it.Attributes.Name,
+                            "genres": genres,
+                            "url": it.Attributes.URL,
+                        })
+                    }
+                }
+            }
+            c.JSON(http.StatusOK, gin.H{"items": out})
+        })
+		// 创建任务（支持 urls 批量，也兼容单个 url）
+		v1.POST("/tasks", func(c *gin.Context) {
+			var req createTaskReq
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+
+			// 兼容：如果老字段 url 传了而 urls 为空，就塞到 urls 里
+			if len(req.URLs) == 0 && strings.TrimSpace(req.URL) != "" {
+				req.URLs = []string{strings.TrimSpace(req.URL)}
+			}
+
+			// 若 urls 只有一条且原始 url 字段包含分隔符，则按换行/逗号/空白拆分覆盖
+			if len(req.URLs) == 1 && strings.TrimSpace(req.URL) != "" {
+				raw := strings.TrimSpace(req.URL)
+				if strings.ContainsAny(raw, ",\n\r\t ") {
+					parts := regexp.MustCompile(`[\,\n\r\t\s]+`).Split(raw, -1)
+					req.URLs = req.URLs[:0]
+					for _, p := range parts {
+						u := strings.TrimSpace(p)
+						if u != "" {
+							req.URLs = append(req.URLs, u)
+						}
+					}
+				}
+			}
+
+			// 校验：若 urls 为空，尝试从 url 拆分多条
+			if len(req.URLs) == 0 {
+				if s := strings.TrimSpace(req.URL); s != "" {
+					parts := regexp.MustCompile(`[\,\n\r\t\s]+`).Split(s, -1)
+					for _, p := range parts {
+						u := strings.TrimSpace(p)
+						if u != "" {
+							req.URLs = append(req.URLs, u)
+						}
+					}
+				}
+				if len(req.URLs) == 0 {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "urls required"})
+					return
+				}
+			}
+			if req.Quality == "" {
+				req.Quality = "alac"
+			}
+			switch req.Quality {
+			case "alac", "aac", "atmos":
+			default:
+				c.JSON(http.StatusBadRequest, gin.H{"error": "quality must be one of: alac|aac|atmos"})
+				return
+			}
+			if req.MaxRetries < 0 {
+				req.MaxRetries = 0
+			} else if req.MaxRetries == 0 {
+				req.MaxRetries = 3 // 默认自动重试 3 次
+			}
+
+			ids := make([]string, 0, len(req.URLs))
+			for _, raw := range req.URLs {
+				u := strings.TrimSpace(raw)
+				if u == "" {
+					continue
+				}
+				// 创建任务（确保你的 mgr.Create 返回 *Task）
+				t := mgr.Create(u, req.Quality, token)
+
+				// 把可选字段塞进任务，供 Runner 使用
+				mgr.mu.Lock()
+				t.Tracks = append([]int(nil), req.Tracks...)
+				t.SongOnly = req.SongOnly
+				t.MaxRetries = req.MaxRetries
+				t.Token = token // Runner 用 t.Token
+				mgr.mu.Unlock()
+
+				ids = append(ids, t.ID)
+			}
+
+			if len(ids) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "no valid urls"})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"taskIds": ids,
+				"count":   len(ids),
+			})
+		})
+
+        // 列表
+        v1.GET("/tasks", func(c *gin.Context) {
+            c.JSON(http.StatusOK, mgr.List())
+        })
+
+        // 清除已完成/失败的任务记录
+        v1.DELETE("/tasks/completed", func(c *gin.Context) {
+            n := mgr.ClearCompleted()
+            c.JSON(http.StatusOK, gin.H{"deleted": n})
+        })
+
+        // 详情
+        v1.GET("/tasks/:id", func(c *gin.Context) {
+            id := c.Param("id")
+            if t, ok := mgr.Get(id); ok {
+                c.JSON(http.StatusOK, t)
+                return
+            }
+            c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+        })
+
+        // 删除单个任务（运行中返回 409）
+        v1.DELETE("/tasks/:id", func(c *gin.Context) {
+            id := c.Param("id")
+            if ok := mgr.Delete(id); ok {
+                c.Status(http.StatusNoContent)
+                return
+            }
+            // 区分不存在与运行中
+            if _, exist := mgr.Get(id); exist {
+                c.JSON(http.StatusConflict, gin.H{"error": "task is running"})
+            } else {
+                c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+            }
+        })
+
+        // 取消任务（排队=直接取消；运行中=请求取消）
+        v1.POST("/tasks/:id/cancel", func(c *gin.Context) {
+            id := c.Param("id")
+            if ok := mgr.Cancel(id); ok {
+                c.JSON(http.StatusAccepted, gin.H{"status": "cancel requested"})
+                return
+            }
+            c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+        })
+
+		// 手动重试：将失败/成功/已完成的任务重置并重新入队
+		v1.POST("/tasks/:id/retry", func(c *gin.Context) {
+			id := c.Param("id")
+			mgr.mu.Lock()
+			t, ok := mgr.tasks[id]
+			if ok {
+				// 不允许对正在运行的任务进行重试
+				if t.Status == StatusRunning {
+					mgr.mu.Unlock()
+					c.JSON(http.StatusConflict, gin.H{"error": "task is running"})
+					return
+				}
+				// 重置状态并入队
+				t.Status = StatusQueued
+				t.Progress = 0
+				t.DoneUnits = 0
+				t.TotalUnits = 0
+				t.Message = "manual retry"
+				t.Logs = append(t.Logs, "manual retry")
+				mgr.mu.Unlock()
+				mgr.queue <- id
+				c.JSON(http.StatusAccepted, gin.H{"status": "requeued"})
+				return
+			}
+			mgr.mu.Unlock()
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		})
+
+		// 单任务 SSE 进度（简单实现：每秒推送一次快照，直到结束/断开）
+		v1.GET("/tasks/:id/stream", func(c *gin.Context) {
+			id := c.Param("id")
+			c.Writer.Header().Set("Content-Type", "text/event-stream")
+			c.Writer.Header().Set("Cache-Control", "no-cache")
+			c.Writer.Header().Set("Connection", "keep-alive")
+			c.Writer.Header().Set("X-Accel-Buffering", "no")
+			flusher, ok := c.Writer.(http.Flusher)
+			if !ok {
+				c.Status(http.StatusInternalServerError)
+				return
+			}
+			ctx := c.Request.Context()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(1 * time.Second):
+					mgr.mu.RLock()
+					t, ok := mgr.tasks[id]
+					if !ok {
+						mgr.mu.RUnlock()
+						fmt.Fprintf(c.Writer, "event: end\n")
+						fmt.Fprintf(c.Writer, "data: {\"error\":\"not found\"}\n\n")
+						flusher.Flush()
+						return
+					}
+					// 复制快照，避免竞态
+					snap := *t
+					mgr.mu.RUnlock()
+					b, _ := json.Marshal(snap)
+					fmt.Fprintf(c.Writer, "data: %s\n\n", string(b))
+					flusher.Flush()
+
+					if snap.Status == StatusSucceeded || snap.Status == StatusFailed {
+						fmt.Fprintf(c.Writer, "event: end\n")
+						fmt.Fprintf(c.Writer, "data: {\"status\":\"%s\"}\n\n", snap.Status)
+						flusher.Flush()
+						return
+					}
+				}
+			}
+		})
+
+		// 元数据：根据专辑链接返回曲目列表，方便 Web 端选曲
+		v1.GET("/meta/album", func(c *gin.Context) {
+			urlRaw := strings.TrimSpace(c.Query("url"))
+			if urlRaw == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "url required"})
+				return
+			}
+			storefront, albumId := checkUrl(urlRaw)
+			if storefront == "" || albumId == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid album url"})
+				return
+			}
+			album := task.NewAlbum(storefront, albumId)
+			if err := album.GetResp(token, Config.Language); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			meta := album.Resp
+			tracks := make([]gin.H, 0, len(meta.Data[0].Relationships.Tracks.Data))
+			for i, tr := range meta.Data[0].Relationships.Tracks.Data {
+				tracks = append(tracks, gin.H{
+					"index": i + 1,
+					"id":    tr.ID,
+					"name":  tr.Attributes.Name,
+				})
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"title":  meta.Data[0].Attributes.Name,
+				"artist": meta.Data[0].Attributes.ArtistName,
+				"cover":  meta.Data[0].Attributes.Artwork.URL,
+				"tracks": tracks,
+			})
+		})
+
+		// 元数据：根据艺术家链接返回其专辑列表（时间升序）
+		v1.GET("/meta/artist", func(c *gin.Context) {
+			artistUrl := strings.TrimSpace(c.Query("url"))
+			if artistUrl == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "url required"})
+				return
+			}
+			storefront, artistId := checkUrlArtist(artistUrl)
+			if storefront == "" || artistId == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid artist url"})
+				return
+			}
+			// 直接调 Apple API 获取专辑列表，简化为 100/批 的分页
+			options := make([][]string, 0)
+			offset := 0
+			for {
+				req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/artists/%s/albums?limit=100&offset=%d&l=%s", storefront, artistId, offset, Config.Language), nil)
+				if err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+					return
+				}
+				req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+				req.Header.Set("User-Agent", "Mozilla/5.0")
+				req.Header.Set("Origin", "https://music.apple.com")
+				do, err := http.DefaultClient.Do(req)
+				if err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+					return
+				}
+				defer do.Body.Close()
+				if do.StatusCode != http.StatusOK {
+					c.JSON(http.StatusBadRequest, gin.H{"error": do.Status})
+					return
+				}
+				obj := new(structs.AutoGeneratedArtist)
+				if err := json.NewDecoder(do.Body).Decode(&obj); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+					return
+				}
+				for _, album := range obj.Data {
+					options = append(options, []string{album.Attributes.Name, album.Attributes.ReleaseDate, album.ID, album.Attributes.URL})
+				}
+				if len(obj.Next) == 0 {
+					break
+				}
+				offset += 100
+			}
+			sort.Slice(options, func(i, j int) bool {
+				dateI, _ := time.Parse("2006-01-02", options[i][1])
+				dateJ, _ := time.Parse("2006-01-02", options[j][1])
+				return dateI.Before(dateJ)
+			})
+			out := make([]gin.H, 0, len(options))
+			for _, v := range options {
+				out = append(out, gin.H{
+					"name": v[0],
+					"date": v[1],
+					"id":   v[2],
+					"url":  v[3],
+				})
+			}
+			c.JSON(http.StatusOK, gin.H{"albums": out})
+		})
+	}
 }

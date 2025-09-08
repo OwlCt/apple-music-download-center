@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Apple Music 下载中心</title>
+  <style>
+    :root {
+      --bg: #0b1020; --panel: #121831; --muted: #9aa4c7;
+      --text: #f3f6ff; --accent: #6aa6ff; --accent2: #8b6aff;
+      --ok: #30d07a; --warn: #ffb020; --err: #ff5d5d;
+      --border: #1f2750;
+    }
+    html, body { height: 100%; }
+    body { margin: 0; background: radial-gradient(1200px 800px at 20% -10%, #1a2250 0%, var(--bg) 58%), linear-gradient(180deg, #0c142b 0%, var(--bg) 100%); color: var(--text); font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial; }
+    .container { max-width: 1080px; margin: 0 auto; padding: 20px 16px 40px; }
+    .topbar { display: flex; align-items: center; gap: 12px; }
+    h1 { font-size: 20px; letter-spacing: 0.3px; margin: 0 8px 0 0; color: #eaf0ff; }
+    .pill { padding: 6px 10px; border: 1px solid var(--border); background: rgba(255,255,255,.03); border-radius: 999px; color: var(--muted); font-size: 12px; }
+    .spacer { flex: 1; }
+    .btn { padding: 8px 12px; border: 1px solid var(--border); background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02)); color: var(--text); border-radius: 8px; cursor: pointer; }
+    .btn:hover { border-color: #2c3770; }
+    .danger { border-color: rgba(255,93,93,.35); color: #ffd6d6; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 14px; margin-top: 14px; }
+    /* 始终上下布局，禁用宽屏两列 */
+    @media (min-width: 960px){ .grid { grid-template-columns: 1fr; } }
+    .panel { background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02)); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+    .panel h2 { font-size: 14px; margin: 0 0 10px; color: #eaf0ff; letter-spacing: .2px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 10px; }
+    .tab { padding: 6px 10px; border-radius: 8px; cursor: pointer; color: var(--muted); border: 1px solid transparent; }
+    .tab.active { color: var(--text); border-color: var(--border); background: rgba(106,166,255,.08); }
+    /* 修复旧文件里第二个tab文本损坏导致的可读性问题：隐藏第2个tab */
+    .tabs .tab:nth-child(2){ display:none; }
+    label { color: var(--muted); font-size: 12px; }
+    input, select, textarea { width: 100%; box-sizing: border-box; color: var(--text); background: rgba(255,255,255,.04); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+    select { background-color: #141a33; }
+    select option { background: #0f1530; color: #eaf0ff; }
+    select:focus { outline: 1px solid var(--accent); }
+    ::selection { background: #6aa6ff55; color: #fff; }
+    textarea { height: 120px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .meta { display: grid; grid-template-columns: 96px 1fr; gap: 10px; margin: 10px 0; align-items: center; }
+    .meta img { width: 96px; height: 96px; border-radius: 8px; object-fit: cover; border: 1px solid var(--border); }
+    .list { max-height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+    .list.resizable { max-height: none; resize: vertical; min-height: 180px; max-height: 70vh; }
+    .list table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    .list th, .list td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; text-align: center; }
+    /* URL 列左对齐以便阅读 */
+    .list td.col-url, .list th.col-url { text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .list th { position: sticky; top: 0; background: rgba(18,24,49,.92); backdrop-filter: blur(6px); }
+    .list tbody tr:nth-child(odd){ background: rgba(255,255,255,.02); }
+    .list tbody tr:hover{ background: rgba(106,166,255,.10); }
+    .actions { display: flex; flex-direction: column; gap: 6px; justify-content: flex-start; align-items: stretch; }
+    .actions button { margin: 0; }
+    .progress { width: 140px; background: rgba(255,255,255,.08); border-radius: 999px; overflow: hidden; height: 8px; margin: 0 auto; }
+    .progress > span { display: block; height: 8px; background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+    .status-queued { color: var(--warn); font-weight:600; }
+    .status-running { color: var(--accent); font-weight:600; }
+    .status-succeeded { color: var(--ok); font-weight:600; }
+    .status-failed { color: var(--err); font-weight:600; }
+    .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .badge { padding: 2px 6px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); font-size: 11px; }
+  </style>
+  <script>
+    // --------------- Utils & API ---------------
+    async function api(path, opts = {}) {
+      const res = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+      if (!res.ok) {
+        let msg = res.status + ' ' + res.statusText;
+        try { const j = await res.json(); if (j && j.error) msg += `\n${j.error}` } catch {}
+        throw new Error(msg);
+      }
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('application/json')) return res.json();
+      return res.text();
+    }
+    const esc = s => (s || '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+    const sid = id => id ? id.split('-')[0] : '';
+
+    // 显示名称缓存与解析（将 URL 替换为专辑名称）
+    const nameCache = new Map(); // url -> display name
+    const albumUrlRe = /\/album\//i;
+    function isAlbumUrl(u){ try{ return albumUrlRe.test(String(u||'')); }catch{ return false; } }
+    async function getDisplayName(url){
+      if (!url) return '';
+      if (nameCache.has(url)) return nameCache.get(url);
+      // 先用 URL 的 slug 作为占位
+      let placeholder = url;
+      try {
+        const u = new URL(url);
+        const parts = u.pathname.split('/').filter(Boolean);
+        const i = parts.indexOf('album');
+        if (i >= 0 && i + 1 < parts.length) {
+          placeholder = decodeURIComponent(parts[i+1]).replaceAll('-', ' ');
+        }
+      } catch {}
+      nameCache.set(url, placeholder);
+      // 专辑链接：异步拉取元数据并更新缓存
+      if (isAlbumUrl(url)) {
+        try {
+          const meta = await api(`/v1/meta/album?url=${encodeURIComponent(url)}`);
+          if (meta && meta.title) {
+            nameCache.set(url, String(meta.title));
+            renderTasks(); // 名称更新后刷新一次表格
+          }
+        } catch {}
+      }
+      return nameCache.get(url);
+    }
+
+    // --------------- State ---------------
+    let tasksCache = [];
+    let activeTab = 'album';
+
+    // --------------- Tasks ---------------
+    function filteredTasks() {
+      const q = document.querySelector('#q').value.trim().toLowerCase();
+      const st = document.querySelector('#status').value;
+      return tasksCache.filter(t => {
+        const hit = !q || (t.url && t.url.toLowerCase().includes(q)) || (t.message && t.message.toLowerCase().includes(q)) || (t.id && t.id.toLowerCase().includes(q));
+        const ok = st === 'all' || t.status === st;
+        return hit && ok;
+      });
+    }
+
+    function renderTasks() {
+      const tbody = document.querySelector('#tasks tbody');
+      tbody.innerHTML = '';
+      for (const t of filteredTasks()) {
+        const tr = document.createElement('tr');
+        tr.dataset.id = t.id;
+        const percent = Math.max(0, Math.min(100, t.progress || 0));
+        // 信息列：运行中显示“歌名 · 子进度”；完成/失败显示简洁说明
+        const infoPieces = [];
+        if (t.status === 'running') {
+          if (t.subMessage) infoPieces.push(esc(t.subMessage));
+          if (typeof t.subPercent === 'number') infoPieces.push(`${t.subPercent}%`);
+        } else if (t.status === 'succeeded') {
+          const total = t.totalUnits || t.doneUnits || 0;
+          infoPieces.push(total ? `已完成 ${total} 首` : '全部完成');
+        } else if (t.status === 'failed') {
+          infoPieces.push('失败');
+          if (t.message) infoPieces.push(esc(t.message));
+        } else {
+          if (t.message) infoPieces.push(esc(t.message));
+        }
+        const infoText = infoPieces.join(' · ');
+        // URL/名称列：优先显示缓存的名称，同时异步补全
+        const display = nameCache.has(t.url) ? nameCache.get(t.url) : t.url;
+        getDisplayName(t.url);
+
+        tr.innerHTML = `
+          <td class="muted">${esc(sid(t.id))}</td>
+          <td class="col-url" title="${esc(t.url)}">${esc(display)}</td>
+          <td>${esc(t.quality || '')}</td>
+          <td class="status-${esc(t.status)}">${esc(t.status)}</td>
+          <td>
+            <div class="progress"><span style="width:${percent}%"></span></div>
+            ${t.totalUnits ? `<div class="muted">${t.status==='running' ? `第 ${Math.min((t.doneUnits||0)+1, t.totalUnits)} / ${t.totalUnits} 首` : `已完成 ${(t.doneUnits||0)} / ${t.totalUnits} 首`}</div>` : ''}
+          </td>
+          <td>${infoText}</td>
+          <td class="actions">
+            <button class="btn" data-act="retry">重试</button>
+            <button class="btn" data-act="cancel">取消</button>
+            <button class="btn danger" data-act="delete">删除</button>
+          </td>`;
+        tbody.appendChild(tr);
+      }
+      document.querySelector('#count').textContent = '' + tasksCache.length;
+    }
+
+    async function loadTasks() {
+      try { tasksCache = await api('/v1/tasks'); renderTasks(); applyAutoHeight(); } catch(e){ console.error(e); }
+    }
+
+    async function onTableClick(e) {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      const tr = e.target.closest('tr');
+      const id = tr && tr.dataset.id;
+      if (!id) return;
+      const act = btn.dataset.act;
+      try {
+        if (act === 'cancel') {
+          await api(`/v1/tasks/${id}/cancel`, { method: 'POST' });
+        } else if (act === 'delete') {
+          const res = await fetch(`/v1/tasks/${id}`, { method: 'DELETE' });
+          if (res.status === 409) throw new Error('任务正在进行，无法删除');
+          if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+        } else if (act === 'retry') {
+          await api(`/v1/tasks/${id}/retry`, { method: 'POST' });
+        }
+        loadTasks();
+      } catch (e2) { alert('操作失败:\n' + e2.message); }
+    }
+
+    async function onClearCompleted(){
+      if (!confirm('清除已完成/失败的任务记录？')) return;
+      try { const r = await api('/v1/tasks/completed', { method: 'DELETE' }); alert('已删除：' + (r.deleted || 0)); loadTasks(); } catch(e){ alert('清除失败:\n' + e.message); }
+    }
+
+    // --------------- Creators ---------------
+    async function createWithUrls(urls, {quality, maxRetries, tracks}){
+      const payload = { urls, quality, maxRetries };
+      if (Array.isArray(tracks) && tracks.length) payload.tracks = tracks;
+      const res = await api('/v1/tasks', { method: 'POST', body: JSON.stringify(payload) });
+      alert('已创建任务：' + res.count);
+      loadTasks();
+    }
+
+    // Album tab
+    async function fetchAlbum(){
+      const url = document.querySelector('#albumUrl').value.trim();
+      if (!url) return alert('请输入专辑链接');
+      try {
+        const meta = await api('/v1/meta/album?url=' + encodeURIComponent(url));
+        document.querySelector('#albumMeta').innerHTML = `
+          <div class="meta">
+            <img src="${esc(meta.cover || '').replace('{w}x{h}bb', '200x200bb')}" alt="cover" />
+            <div>
+              <div style="font-size:16px; font-weight:600;">${esc(meta.title)}</div>
+              <div class="muted">${esc(meta.artist)}</div>
+            </div>
+          </div>`;
+        const tbody = document.querySelector('#albumTracks tbody');
+        tbody.innerHTML = '';
+        (meta.tracks || []).forEach(t => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td><input type="checkbox" data-idx="${t.index}" checked></td><td class="muted">${t.index}</td><td>${esc(t.name)}</td>`;
+          tbody.appendChild(tr);
+        });
+        document.querySelector('#albumActions').style.display = 'flex';
+      } catch(e){ alert('获取失败:\n' + e.message); }
+    }
+    async function searchAlbum(){
+      const q = document.querySelector('#albumQuery').value.trim();
+      if (!q) return alert('请输入关键词');
+      try {
+        const res = await api('/v1/search?type=album&q=' + encodeURIComponent(q));
+        const list = res.items || [];
+        const box = document.querySelector('#albumSearchBox');
+        const tbody = document.querySelector('#albumSearchBody');
+        tbody.innerHTML = '';
+        list.forEach(it => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td class="muted">${esc(it.year||'')}</td><td>${esc(it.name)}</td><td class="muted">${esc(it.artist)}</td><td><button class="btn" data-url="${esc(it.url)}">选择</button></td>`;
+          tbody.appendChild(tr);
+        });
+        box.style.display = list.length ? 'block' : 'none';
+        tbody.onclick = (e)=>{
+          const btn = e.target.closest('button[data-url]');
+          if (!btn) return;
+          document.querySelector('#albumUrl').value = btn.dataset.url;
+          fetchAlbum();
+          box.style.display = 'none';
+        };
+      } catch(e){ alert('搜索失败:\n' + e.message); }
+    }
+    function albumToggle(sel){
+      const cbs = document.querySelectorAll('#albumTracks input[type="checkbox"]');
+      cbs.forEach(cb => cb.checked = sel === 'all' ? true : sel === 'none' ? false : !cb.checked);
+    }
+    async function albumCreate(){
+      const url = document.querySelector('#albumUrl').value.trim();
+      const quality = document.querySelector('#quality').value;
+      const maxRetries = parseInt(document.querySelector('#maxRetries').value || '3', 10);
+      const tracks = Array.from(document.querySelectorAll('#albumTracks input:checked')).map(cb => parseInt(cb.dataset.idx,10));
+      if (!url) return alert('请输入专辑链接');
+      if (!tracks.length && !confirm('未选择曲目，将默认下载整张专辑，继续？')) return;
+      await createWithUrls([url], {quality, songOnly:false, maxRetries, tracks});
+      document.querySelector('#albumActions').style.display = 'none';
+      document.querySelector('#albumTracks tbody').innerHTML = '';
+      document.querySelector('#albumMeta').innerHTML = '';
+      document.querySelector('#albumUrl').value = '';
+    }
+
+    // Artist tab
+    async function fetchArtist(){
+      const url = document.querySelector('#artistUrl').value.trim();
+      if (!url) return alert('请输入艺术家链接');
+      try {
+        const meta = await api('/v1/meta/artist?url=' + encodeURIComponent(url));
+        const tbody = document.querySelector('#artistAlbums tbody');
+        tbody.innerHTML = '';
+        (meta.albums || []).forEach((a, i) => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td><input type="checkbox" data-url="${esc(a.url)}"></td><td class="muted">${i+1}</td><td>${esc(a.name)}</td><td class="muted">${esc(a.date)}</td>`;
+          tbody.appendChild(tr);
+        });
+        document.querySelector('#artistActions').style.display = 'flex';
+      } catch(e){ alert('获取失败:\n' + e.message); }
+    }
+    async function searchArtist(){
+      const q = document.querySelector('#artistQuery').value.trim();
+      if (!q) return alert('请输入关键词');
+      try {
+        const res = await api('/v1/search?type=artist&q=' + encodeURIComponent(q));
+        const list = res.items || [];
+        const box = document.querySelector('#artistSearchBox');
+        const tbody = document.querySelector('#artistSearchBody');
+        tbody.innerHTML = '';
+        list.forEach(it => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${esc(it.name)}</td><td class="muted">${esc(it.genres||'')}</td><td><button class="btn" data-url="${esc(it.url)}">选择</button></td>`;
+          tbody.appendChild(tr);
+        });
+        box.style.display = list.length ? 'block' : 'none';
+        tbody.onclick = (e)=>{
+          const btn = e.target.closest('button[data-url]');
+          if (!btn) return;
+          document.querySelector('#artistUrl').value = btn.dataset.url;
+          fetchArtist();
+          box.style.display = 'none';
+        };
+      } catch(e){ alert('搜索失败:\n' + e.message); }
+    }
+    function artistToggle(sel){
+      const cbs = document.querySelectorAll('#artistAlbums input[type="checkbox"]');
+      cbs.forEach(cb => cb.checked = sel === 'all' ? true : sel === 'none' ? false : !cb.checked);
+    }
+    async function artistCreate(){
+      const urls = Array.from(document.querySelectorAll('#artistAlbums input:checked')).map(cb => cb.dataset.url).filter(Boolean);
+      if (!urls.length) return alert('请选择至少一张专辑');
+      const quality = document.querySelector('#quality').value;
+      const maxRetries = parseInt(document.querySelector('#maxRetries').value || '3', 10);
+      await createWithUrls(urls, {quality, maxRetries});
+      document.querySelector('#artistActions').style.display = 'none';
+      document.querySelector('#artistAlbums tbody').innerHTML = '';
+      document.querySelector('#artistUrl').value = '';
+    }
+
+    // Direct tab
+    async function directCreate(e){
+      e.preventDefault();
+      const raw = document.querySelector('#urls').value.trim();
+      if (!raw) return alert('请输入链接');
+      const quality = document.querySelector('#quality').value;
+      const maxRetries = parseInt(document.querySelector('#maxRetries').value || '3', 10);
+      // 按换行/逗号/空白拆分为多条
+      const parts = raw.split(/[\,\n\r\t\s]+/).map(s=>s.trim()).filter(Boolean);
+      await createWithUrls(parts, {quality, maxRetries});
+      document.querySelector('#urls').value = '';
+    }
+    async function searchSong(){
+      const q = document.querySelector('#songQuery').value.trim();
+      if (!q) return alert('请输入关键词');
+      try {
+        const res = await api('/v1/search?type=song&q=' + encodeURIComponent(q));
+        const list = res.items || [];
+        const box = document.querySelector('#songSearchBox');
+        const tbody = document.querySelector('#songSearchBody');
+        tbody.innerHTML = '';
+        list.forEach(it => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td><input type="checkbox" data-url="${esc(it.url)}"></td><td>${esc(it.name)}</td><td class="muted">${esc(it.artist)}</td><td class="muted">${esc(it.album||'')}</td>`;
+          tbody.appendChild(tr);
+        });
+        box.style.display = list.length ? 'block' : 'none';
+        document.querySelector('#songSearchActions').style.display = list.length ? 'flex' : 'none';
+      } catch(e){ alert('搜索失败:\n' + e.message); }
+    }
+    function addSelectedSongs(){
+      const urls = Array.from(document.querySelectorAll('#songSearchBody input:checked')).map(cb => cb.dataset.url).filter(Boolean);
+      if (!urls.length) return alert('请勾选歌曲');
+      const ta = document.querySelector('#urls');
+      const existing = ta.value.trim();
+      const add = urls.join('\n');
+      ta.value = existing ? (existing + '\n' + add) : add;
+      alert('已加入 ' + urls.length + ' 首歌曲到下方列表');
+    }
+
+    // Tabs
+    function setTab(tab){
+      activeTab = tab;
+      document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active', x.dataset.tab===tab));
+      document.querySelectorAll('.tabpane').forEach(x=>x.style.display = x.dataset.tab===tab ? 'block':'none');
+    }
+
+    // Init
+    let timer;
+    function startPolling(){ if (timer) clearInterval(timer); timer = setInterval(loadTasks, 2000); }
+    window.addEventListener('DOMContentLoaded', () => {
+      // tabs
+      document.querySelectorAll('.tab').forEach(x=>x.addEventListener('click', ()=>setTab(x.dataset.tab)));
+      setTab('album');
+
+      // search/filter
+      document.querySelector('#q').addEventListener('input', renderTasks);
+      document.querySelector('#status').addEventListener('change', renderTasks);
+
+      // actions
+      document.querySelector('#tasks').addEventListener('click', onTableClick);
+      document.querySelector('#clearCompleted').addEventListener('click', onClearCompleted);
+
+      // album
+      document.querySelector('#btnFetchAlbum').addEventListener('click', fetchAlbum);
+      document.querySelector('#btnSearchAlbum').addEventListener('click', searchAlbum);
+      document.querySelector('#btnAlbumAll').addEventListener('click', ()=>albumToggle('all'));
+      document.querySelector('#btnAlbumNone').addEventListener('click', ()=>albumToggle('none'));
+      document.querySelector('#btnAlbumInv').addEventListener('click', ()=>albumToggle('inv'));
+      document.querySelector('#btnAlbumCreate').addEventListener('click', albumCreate);
+
+      // artist
+      document.querySelector('#btnFetchArtist').addEventListener('click', fetchArtist);
+      document.querySelector('#btnSearchArtist').addEventListener('click', searchArtist);
+      document.querySelector('#btnArtistAll').addEventListener('click', ()=>artistToggle('all'));
+      document.querySelector('#btnArtistNone').addEventListener('click', ()=>artistToggle('none'));
+      document.querySelector('#btnArtistInv').addEventListener('click', ()=>artistToggle('inv'));
+      document.querySelector('#btnArtistCreate').addEventListener('click', artistCreate);
+
+      // direct
+      document.querySelector('#directForm').addEventListener('submit', directCreate);
+      document.querySelector('#btnSearchSong').addEventListener('click', searchSong);
+      document.querySelector('#btnSongAdd').addEventListener('click', addSelectedSongs);
+
+      // height controls
+      initHeightControls();
+      loadTasks();
+      startPolling();
+    });
+
+    // --------------- Height controls ---------------
+    function initHeightControls(){
+      const box = document.getElementById('tasksList');
+      const chk = document.getElementById('autoHeight');
+      const savedAuto = localStorage.getItem('autoTaskHeight');
+      const savedH = parseInt(localStorage.getItem('taskListHeight') || '0', 10);
+      if (savedAuto !== null) chk.checked = savedAuto === '1';
+      if (!chk.checked && savedH > 0) box.style.height = savedH + 'px';
+
+      chk.addEventListener('change', () => {
+        localStorage.setItem('autoTaskHeight', chk.checked ? '1' : '0');
+        if (chk.checked) { applyAutoHeight(); } else {
+          // keep current height as manual baseline
+          localStorage.setItem('taskListHeight', String(box.offsetHeight));
+        }
+      });
+
+      // When user manually resizes, disable auto and save height
+      let mdown = false;
+      box.addEventListener('mousedown', (e)=>{ mdown = true; });
+      window.addEventListener('mouseup', ()=>{
+        if (mdown) {
+          mdown = false;
+          localStorage.setItem('taskListHeight', String(box.offsetHeight));
+          chk.checked = false;
+          localStorage.setItem('autoTaskHeight', '0');
+        }
+      });
+      window.addEventListener('resize', ()=>{ applyAutoHeight(); });
+    }
+
+    function getActiveVisibleCount() {
+  const actives = new Set([
+    'downloading', 'running', 'in-progress', 'processing',
+    'queued', 'queue', 'pending', 'waiting'
+  ]);
+  const list = (typeof filteredTasks === 'function') ? filteredTasks() : [];
+  return list.reduce((n, t) => n + (t && actives.has(String(t.status || '').toLowerCase()) ? 1 : 0), 0);
+}
+
+function applyAutoHeight() {
+  const chk = document.getElementById('autoHeight');
+  const box = document.getElementById('tasksList');
+  if (!chk || !box || !chk.checked) return;
+
+  const visible = (typeof filteredTasks === 'function') ? filteredTasks() : [];
+  const totalVisible = visible.length;
+
+  const activeCount = getActiveVisibleCount();
+  const targetRows = Math.min(totalVisible, Math.max(0, activeCount + 2));
+
+  const firstRow = document.querySelector('#tasks tbody tr');
+  const thead = document.querySelector('#tasks thead');
+  const rowH = (firstRow && firstRow.offsetHeight) || 40;
+  const headerH = (thead && thead.offsetHeight) || 60;
+
+  const desired = headerH + targetRows * rowH;
+  const minH = 180;
+  const maxH = Math.floor(window.innerHeight * 0.8);
+
+  const finalH = totalVisible === 0 ? minH : Math.min(Math.max(desired, minH), maxH);
+  box.style.height = finalH + 'px';
+}
+
+    // 一键清理下载目录
+    async function onClearDownloads(){
+      const tip = '确认清空下载目录（' + ['download','download-aac','download-atmos'].join('、') + '）中的全部内容？此操作不可恢复。';
+      if (!confirm(tip)) return;
+      try {
+        const r = await api('/v1/cleanup-downloads', { method: 'POST' });
+        const msg = `已删除 文件 ${r.deletedFiles||0} 个、文件夹 ${r.deletedDirs||0} 个`;
+        alert(msg);
+      } catch(e) {
+        alert('清空失败:\n' + e.message);
+      }
+    }
+
+    // 绑定按钮事件（追加监听，避免受其它初始化影响）
+    window.addEventListener('DOMContentLoaded', () => {
+      const btn = document.querySelector('#clearDownloads');
+      if (btn) btn.addEventListener('click', onClearDownloads);
+    });
+
+  </script>
+
+<style id="auto-patch-style">
+/* --- Patch: textarea 仅纵向拉伸，任务列表禁用横向滚动 --- */
+#urls { resize: vertical; }
+#tasksList { overflow-x: hidden; }
+
+/* --- Patch: 背景断层修复 --- */
+body {
+  margin: 0;
+  background: linear-gradient(180deg, #0c142b 0%, var(--bg) 100%);
+  background-repeat: no-repeat;
+  background-color: var(--bg);
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(2000px 1400px at 20% -10%, #1a2250 0%, rgba(26,34,80,0) 60%);
+}
+</style>
+
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <h1>Apple Music 下载中心</h1>
+      <span class="pill">任务 <span id="count">0</span></span>
+      <div class="spacer"></div>
+      <button class="btn" id="clearDownloads">清空下载目录</button>
+      <button class="btn danger" id="clearCompleted">清空已完成</button>
+    </div>
+
+    <div class="grid">
+      <!-- Left: Creator -->
+      <div class="panel">
+        <h2>新建任务</h2>
+        <div class="tabs">
+          <div class="tab active" data-tab="album">专辑</div>
+          <div class="tab" data-tab="artist">艺术家</div>
+          <div class="tab" data-tab="artist">艺术家</div>
+          <div class="tab" data-tab="direct">批量下载</div>
+        </div>
+
+        <!-- Shared options -->
+        <div class="row" style="margin: 8px 0 10px;">
+          <div>
+            <label>质量</label>
+            <select id="quality">
+              <option value="alac">ALAC</option>
+              <option value="aac">AAC</option>
+              <option value="atmos">Atmos</option>
+            </select>
+          </div>
+          <div>
+            <label>最大重试</label>
+            <select id="maxRetries">
+              <option value="0">0</option>
+              <option value="1">1</option>
+              <option value="3" selected>3</option>
+              <option value="5">5</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Album Tab -->
+        <div class="tabpane" data-tab="album">
+          <div class="row2">
+            <div>
+              <label>专辑链接</label>
+              <input id="albumUrl" placeholder="https://music.apple.com/.../album/.../id..." />
+            </div>
+            <div style="display:flex; align-items:flex-end; gap:8px;">
+              <button class="btn" id="btnFetchAlbum" style="width:100%">获取曲目</button>
+            </div>
+          </div>
+          <div class="row2" style="margin-top:8px; align-items:end;">
+            <div>
+              <label>搜索专辑（关键词）</label>
+              <input id="albumQuery" placeholder="歌手/专辑 关键词" />
+            </div>
+            <div style="display:flex; align-items:flex-end; gap:8px;">
+              <button class="btn" id="btnSearchAlbum" style="width:100%">搜索专辑</button>
+            </div>
+          </div>
+          <div class="list" id="albumSearchBox" style="display:none; margin-top:8px;">
+            <table>
+              <thead><tr><th style="width:60px">年份</th><th>专辑</th><th>艺人</th><th style="width:120px">操作</th></tr></thead>
+              <tbody id="albumSearchBody"></tbody>
+            </table>
+          </div>
+          <div id="albumMeta"></div>
+          <div class="list">
+            <table id="albumTracks">
+              <thead><tr><th style="width:44px"></th><th style="width:60px">#</th><th>曲目</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div id="albumActions" style="display:none; gap:8px; margin-top:10px; align-items:center;">
+            <button class="btn" id="btnAlbumAll">全选</button>
+            <button class="btn" id="btnAlbumNone">全不选</button>
+            <button class="btn" id="btnAlbumInv">反选</button>
+            <div class="spacer"></div>
+            <button class="btn" id="btnAlbumCreate">创建下载</button>
+          </div>
+        </div>
+
+        <!-- Artist Tab -->
+        <div class="tabpane" data-tab="artist" style="display:none;">
+          <div class="row2">
+            <div>
+              <label>艺术家链接</label>
+              <input id="artistUrl" placeholder="https://music.apple.com/.../artist/.../id..." />
+            </div>
+            <div style="display:flex; align-items:flex-end;">
+              <button class="btn" id="btnFetchArtist" style="width:100%">获取专辑</button>
+            </div>
+          </div>
+          <div class="row2" style="margin-top:8px; align-items:end;">
+            <div>
+              <label>搜索艺术家（关键词）</label>
+              <input id="artistQuery" placeholder="艺人名 关键词" />
+            </div>
+            <div style="display:flex; align-items:flex-end; gap:8px;">
+              <button class="btn" id="btnSearchArtist" style="width:100%">搜索艺术家</button>
+            </div>
+          </div>
+          <div class="list" id="artistSearchBox" style="display:none; margin-top:8px;">
+            <table>
+              <thead><tr><th>艺人</th><th>风格</th><th style="width:120px">操作</th></tr></thead>
+              <tbody id="artistSearchBody"></tbody>
+            </table>
+          </div>
+          <div class="list" style="margin-top:8px;">
+            <table id="artistAlbums">
+              <thead><tr><th style="width:44px"></th><th style="width:60px">#</th><th>专辑</th><th>日期</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div id="artistActions" style="display:none; gap:8px; margin-top:10px; align-items:center;">
+            <button class="btn" id="btnArtistAll">全选</button>
+            <button class="btn" id="btnArtistNone">全不选</button>
+            <button class="btn" id="btnArtistInv">反选</button>
+            <div class="spacer"></div>
+            <button class="btn" id="btnArtistCreate">创建下载</button>
+          </div>
+        </div>
+
+        <!-- Direct Tab -->
+        <div class="tabpane" data-tab="direct" style="display:none;">
+          <form id="directForm">
+            <label>批量下载（可多条：换行/逗号/空格分隔）</label>
+            <textarea id="urls" placeholder="https://music.apple.com/...\nhttps://music.apple.com/...\n..."></textarea>
+            <div style="margin-top:10px; display:flex; justify-content:flex-end;">
+              <button class="btn" type="submit">创建下载</button>
+            </div>
+          </form>
+          <div class="row2" style="margin-top:12px; align-items:end;">
+            <div>
+              <label>搜索歌曲（关键词）</label>
+              <input id="songQuery" placeholder="歌名/艺人 关键词" />
+            </div>
+            <div style="display:flex; align-items:flex-end; gap:8px;">
+              <button class="btn" id="btnSearchSong" style="width:100%">搜索歌曲</button>
+            </div>
+          </div>
+          <div class="list" id="songSearchBox" style="display:none; margin-top:8px;">
+            <table>
+              <thead><tr><th style="width:44px"></th><th>歌曲</th><th>艺人</th><th>专辑</th></tr></thead>
+              <tbody id="songSearchBody"></tbody>
+            </table>
+          </div>
+          <div style="display:none; gap:8px; margin-top:8px;" id="songSearchActions">
+            <button class="btn" id="btnSongAdd">将所选加入下方列表</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Tasks -->
+      <div class="panel">
+        <h2>任务列表</h2>
+        <div class="toolbar">
+          <div style="flex:1; display:flex; gap:8px;">
+            <input id="q" placeholder="搜索（URL/信息/ID）" />
+            <select id="status" style="width:160px;">
+              <option value="all">全部状态</option>
+              <option value="queued">排队中</option>
+              <option value="running">进行中</option>
+              <option value="succeeded">已完成</option>
+              <option value="failed">失败</option>
+            </select>
+          </div>
+          <label class="muted" style="display:flex; align-items:center; gap:6px;">
+            <input type="checkbox" id="autoHeight" checked /> 自适应高度
+          </label>
+          <span class="badge">后端每 2 秒刷新</span>
+        </div>
+        <div id="tasksList" class="list resizable">
+          <table id="tasks">
+            <colgroup>
+              <col style="width:80px" />
+              <col />
+              <col style="width:88px" />
+              <col style="width:88px" />
+              <col style="width:200px" />
+              <col />
+              <col style="width:110px" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th style="width:60px">ID</th>
+                <th class="col-url">名称</th>
+                <th style="width:88px">质量</th>
+                <th style="width:88px">状态</th>
+                <th style="width:160px">进度</th>
+                <th>信息</th>
+                <th style="width:110px">操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
